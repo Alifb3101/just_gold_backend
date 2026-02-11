@@ -1,5 +1,4 @@
 const express = require("express");
-const path = require("path");
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
@@ -21,8 +20,7 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve uploaded files
-app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
+// NOTE: All media now stored in Cloudinary - no local uploads folder needed
 
 // Rate limiting
 app.use(
@@ -41,7 +39,7 @@ app.get("/", (req, res) => {
 /* ---------------- ROUTES ---------------- */
 
 app.use("/api/v1/auth", require("./routes/auth.routes"));
-app.use("/api/v1/products", require("./routes/product.routes"));
+app.use("/api/v1", require("./routes/product.routes"));
 app.use("/api/v1/orders", require("./routes/order.routes"));
 app.use("/api/v1/categories", require("./routes/category.routes"));
 
