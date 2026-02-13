@@ -1,48 +1,181 @@
 const pool = require("../config/db");
 const { deleteMultipleFromCloudinary } = require("../config/cloudinary");
+const { getMediaUrl } = require("../services/media.service");
+const {
+  buildProductsQuery,
+  buildCacheKey,
+  normalizeFilters,
+} = require("../services/product.service");
+const { getRedisClient } = require("../config/redis");
 
-const DEFAULT_PAGE_LIMIT = 12;
-const MAX_PAGE_LIMIT = 50;
+const COLOR_PANEL_TYPES = ["hex", "gradient", "image"];
+
+const resolveMediaUrl = (key, url) => {
+  if (key) return getMediaUrl(key);
+  return url || null;
+};
+
+const isValidHexColor = (value) => {
+  if (typeof value !== "string") return false;
+  return /^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{4}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/.test(
+    value.trim()
+  );
+};
+
+const isValidHttpUrl = (value) => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch (_) {
+    return false;
+  }
+};
+
+const isValidGradient = (value) => {
+  if (typeof value !== "string") return false;
+  return /(linear|radial|conic|repeating-linear|repeating-radial)-gradient\s*\(.+\)/i.test(
+    value.trim()
+  );
+};
+
+const validateColorPanel = (rawType, rawValue, { requireValue, uploadedUrl }) => {
+  const hasType = rawType !== undefined && rawType !== null;
+  const hasValue = rawValue !== undefined && rawValue !== null;
+  const hasUploadedUrl = !!uploadedUrl;
+
+  if (requireValue && hasUploadedUrl && !hasType) {
+    return {
+      error: "color_panel_type is required when uploading color panel image",
+    };
+  }
+
+  if (!requireValue && !hasType && !hasValue && !hasUploadedUrl) {
+    return { shouldUpdate: false, colorPanelType: null, colorPanelValue: null };
+  }
+
+  if (!requireValue && (hasValue || hasUploadedUrl) && !hasType) {
+    return {
+      error: "color_panel_type is required when updating color_panel_value",
+    };
+  }
+
+  if (!requireValue && hasType && !(hasValue || hasUploadedUrl)) {
+    return {
+      error: "color_panel_value is required when updating color_panel_type",
+    };
+  }
+
+  const colorPanelType = (rawType || "hex").toString().trim().toLowerCase();
+  const colorPanelValue = (rawValue || "").toString().trim();
+  const finalValue = uploadedUrl || colorPanelValue;
+
+  if (hasUploadedUrl && colorPanelType !== "image") {
+    return {
+      error: "color_panel_type must be image when uploading color panel image",
+    };
+  }
+
+  if (!COLOR_PANEL_TYPES.includes(colorPanelType)) {
+    return {
+      error: "color_panel_type must be one of: hex, gradient, image",
+    };
+  }
+
+  if (!finalValue) {
+    return {
+      error: "color_panel_value is required for color panel configuration",
+    };
+  }
+
+  if (
+    (colorPanelType === "hex" && !isValidHexColor(finalValue)) ||
+    (colorPanelType === "image" && !hasUploadedUrl && !isValidHttpUrl(finalValue)) ||
+    (colorPanelType === "gradient" && !isValidGradient(finalValue))
+  ) {
+    return {
+      error: `color_panel_value is not valid for type ${colorPanelType}`,
+    };
+  }
+
+  return { shouldUpdate: true, colorPanelType, colorPanelValue: finalValue };
+};
 
 /* =========================================================
    GET PRODUCTS (WITH PAGINATION)
 ========================================================= */
 exports.getProducts = async (req, res, next) => {
   try {
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const requestedLimit = parseInt(req.query.limit, 10);
-    const limit = Math.min(
-      Math.max(requestedLimit || DEFAULT_PAGE_LIMIT, 1),
-      MAX_PAGE_LIMIT
-    );
-    const offset = (page - 1) * limit;
-
-    const result = await pool.query(
-      `
-      SELECT 
-        p.id,
-        p.name,
-        p.slug,
-        p.base_price,
-        p.description,
-        p.product_model_no,
-        p.thumbnail,
-        p.afterimage,
-        p.created_at
-      FROM products p
-      WHERE p.is_active = true
-      ORDER BY p.created_at DESC
-      LIMIT $1 OFFSET $2
-      `,
-      [limit, offset]
-    );
-
-    res.json({
-      page,
-      limit,
-      count: result.rows.length,
-      products: result.rows,
+    const filters = normalizeFilters({
+      categoryId: req.query.category,
+      minPrice: req.query.minPrice,
+      maxPrice: req.query.maxPrice,
+      color: req.query.color,
+      size: req.query.size,
+      sort: req.query.sort,
+      cursor: req.query.cursor,
     });
+
+    // Temporary debug logging to diagnose empty result issues
+    try {
+      const countResult = await pool.query("SELECT COUNT(*) AS cnt FROM products");
+      const sampleResult = await pool.query(
+        "SELECT id, name, is_active FROM products ORDER BY id ASC LIMIT 10"
+      );
+      console.log("[DEBUG products] total products:", countResult.rows[0]?.cnt);
+      console.log("[DEBUG products] sample rows:", sampleResult.rows);
+      console.log("[DEBUG products] filters:", filters);
+      console.log(
+        "[DEBUG products] db target:",
+        process.env.DATABASE_URL || `${process.env.PGUSER || "postgres"}@${process.env.PGHOST || "localhost"}/${process.env.PGDATABASE || "Just_gold"}`
+      );
+    } catch (dbgErr) {
+      console.warn("[DEBUG products] logging failed:", dbgErr.message);
+    }
+
+    const cacheKey = buildCacheKey(filters);
+    const redis = await getRedisClient();
+
+    if (redis) {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.json(JSON.parse(cached));
+      }
+    }
+
+    const { text, values, limit } = buildProductsQuery(filters);
+
+    console.log("[DEBUG products] final SQL:\n", text);
+    console.log("[DEBUG products] params:", values);
+
+    const result = await pool.query({ text, values });
+
+    const hasMore = result.rows.length > limit;
+    const trimmed = hasMore ? result.rows.slice(0, limit) : result.rows;
+    const nextCursor = hasMore ? trimmed[trimmed.length - 1].id : null;
+    const products = trimmed.map((row) => ({
+      id: row.id,
+      name: row.name,
+      slug: row.slug,
+      price: Number(row.effective_price),
+      base_price: Number(row.base_price),
+      base_stock: row.base_stock,
+      category_id: row.category_id,
+      created_at: row.created_at,
+      thumbnail: resolveMediaUrl(row.thumbnail_key, row.thumbnail),
+      afterimage: resolveMediaUrl(row.afterimage_key, row.afterimage),
+    }));
+
+    const payload = {
+      products,
+      nextCursor,
+      hasMore,
+    };
+
+    if (redis) {
+      await redis.set(cacheKey, JSON.stringify(payload), { EX: 60 });
+    }
+
+    res.json(payload);
   } catch (err) {
     next(err);
   }
@@ -70,6 +203,7 @@ exports.getProductDetail = async (req, res, next) => {
         slug,
         description,
         base_price,
+        base_stock,
         category_id,
         product_model_no,
         how_to_apply,
@@ -77,7 +211,9 @@ exports.getProductDetail = async (req, res, next) => {
         key_features,
         ingredients,
         thumbnail,
+        thumbnail_key,
         afterimage,
+        afterimage_key,
         created_at
       FROM products
       WHERE id = $1
@@ -97,9 +233,13 @@ exports.getProductDetail = async (req, res, next) => {
         id,
         shade,
         color_type,
+        color_panel_type,
+        color_panel_value,
         stock,
         main_image,
+        main_image_key,
         secondary_image,
+        secondary_image_key,
         price,
         discount_price,
         variant_model_no
@@ -113,6 +253,7 @@ exports.getProductDetail = async (req, res, next) => {
     const mediaResult = await pool.query(
       `
       SELECT id, image_url, media_type
+        , image_key
       FROM product_images
       WHERE product_id = $1
       ORDER BY id ASC
@@ -125,23 +266,30 @@ exports.getProductDetail = async (req, res, next) => {
     const canonicalUrl = `/api/v1/product/${product.id}-${product.slug}`;
     const requestedPath = `${req.baseUrl}${req.path}`;
 
+    const productPayload = {
+      ...product,
+      thumbnail: resolveMediaUrl(product.thumbnail_key, product.thumbnail),
+      afterimage: resolveMediaUrl(product.afterimage_key, product.afterimage),
+      variants: variantsResult.rows.map((variant) => ({
+        ...variant,
+        main_image: resolveMediaUrl(variant.main_image_key, variant.main_image),
+        secondary_image: resolveMediaUrl(variant.secondary_image_key, variant.secondary_image),
+      })),
+      media: mediaResult.rows.map((media) => ({
+        ...media,
+        image_url: resolveMediaUrl(media.image_key, media.image_url),
+      })),
+    };
+
     if (requestedSlug && normalizedRequestedSlug !== normalizedProductSlug) {
       if (requestedPath === canonicalUrl) {
         // Prevent redirect loops if the request already targets canonical path
-        return res.json({
-          ...product,
-          variants: variantsResult.rows,
-          media: mediaResult.rows,
-        });
+        return res.json(productPayload);
       }
       return res.redirect(301, canonicalUrl);
     }
 
-    res.json({
-      ...product,
-      variants: variantsResult.rows,
-      media: mediaResult.rows,
-    });
+    res.json(productPayload);
   } catch (err) {
     next(err);
   }
@@ -162,6 +310,7 @@ exports.createProduct = async (req, res, next) => {
       name,
       description,
       base_price,
+      base_stock,
       subcategory_id,
       product_model_no,
       how_to_apply,
@@ -190,8 +339,8 @@ exports.createProduct = async (req, res, next) => {
     const productResult = await client.query(
       `
       INSERT INTO products 
-      (name, slug, description, base_price, category_id, product_model_no, how_to_apply, benefits, key_features, ingredients, thumbnail, afterimage)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      (name, slug, description, base_price, base_stock, category_id, product_model_no, how_to_apply, benefits, key_features, ingredients, thumbnail, afterimage)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       RETURNING id
       `,
       [
@@ -199,6 +348,7 @@ exports.createProduct = async (req, res, next) => {
         slug,
         description,
         base_price,
+        Number.isFinite(parseInt(base_stock, 10)) ? parseInt(base_stock, 10) : 30,
         subcategory_id,
         product_model_no,
         how_to_apply,
@@ -254,10 +404,6 @@ exports.createProduct = async (req, res, next) => {
 
     const parsedVariants = JSON.parse(variants || "[]");
 
-    if (!parsedVariants.length) {
-      throw new Error("At least one variant is required");
-    }
-
     for (let i = 0; i < parsedVariants.length; i++) {
 
       const variant = parsedVariants[i];
@@ -267,12 +413,14 @@ exports.createProduct = async (req, res, next) => {
       const variantImageKey = `variant_main_image_${i}`;
       const secondaryColorKey = `color_secondary_${i}`;
       const secondaryVariantImageKey = `variant_secondary_image_${i}`;
+      const colorPanelImageKey = `color_panel_image_${i}`;
       
       const colorFile = req.files?.[colorKey]?.[0] || req.files?.[variantImageKey]?.[0] || null;
       const secondaryColorFile =
         req.files?.[secondaryColorKey]?.[0] ||
         req.files?.[secondaryVariantImageKey]?.[0] ||
         null;
+      const colorPanelFile = req.files?.[colorPanelImageKey]?.[0] || null;
 
       // Get Cloudinary URLs instead of local paths
       const mainImagePath = colorFile
@@ -285,16 +433,38 @@ exports.createProduct = async (req, res, next) => {
 
       const colorType = variant.color_type || variant.colorType || null;
 
+      const colorPanelUploadedUrl = colorPanelFile
+        ? colorPanelFile.path || colorPanelFile.cloudinary?.secure_url
+        : null;
+
+      const colorPanelValidation = validateColorPanel(
+        variant.color_panel_type || variant.colorPanelType,
+        variant.color_panel_value || variant.colorPanelValue,
+        { requireValue: true, uploadedUrl: colorPanelUploadedUrl }
+      );
+
+      if (colorPanelValidation.error) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          message: colorPanelValidation.error,
+          variant_index: i,
+        });
+      }
+
+      const { colorPanelType, colorPanelValue } = colorPanelValidation;
+
       await client.query(
         `
         INSERT INTO product_variants
-        (product_id, shade, color_type, stock, main_image, secondary_image, price, discount_price, variant_model_no)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        (product_id, shade, color_type, color_panel_type, color_panel_value, stock, main_image, secondary_image, price, discount_price, variant_model_no)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         `,
         [
           productId,
           variant.color,
           colorType,
+          colorPanelType,
+          colorPanelValue,
           variant.stock || 0,
           mainImagePath,
           secondaryImagePath,
@@ -357,6 +527,7 @@ exports.updateProduct = async (req, res, next) => {
       name,
       description,
       base_price,
+      base_stock,
       subcategory_id,
       product_model_no,
       how_to_apply,
@@ -387,21 +558,23 @@ exports.updateProduct = async (req, res, next) => {
         slug = COALESCE($2, slug),
         description = COALESCE($3, description),
         base_price = COALESCE($4, base_price),
-        category_id = COALESCE($5, category_id),
-        product_model_no = COALESCE($6, product_model_no),
-        how_to_apply = COALESCE($7, how_to_apply),
-        benefits = COALESCE($8, benefits),
-        key_features = COALESCE($9, key_features),
-        ingredients = COALESCE($10, ingredients),
-        thumbnail = COALESCE($11, thumbnail),
-        afterimage = COALESCE($12, afterimage)
-      WHERE id = $13
+        base_stock = COALESCE($5, base_stock),
+        category_id = COALESCE($6, category_id),
+        product_model_no = COALESCE($7, product_model_no),
+        how_to_apply = COALESCE($8, how_to_apply),
+        benefits = COALESCE($9, benefits),
+        key_features = COALESCE($10, key_features),
+        ingredients = COALESCE($11, ingredients),
+        thumbnail = COALESCE($12, thumbnail),
+        afterimage = COALESCE($13, afterimage)
+      WHERE id = $14
       `,
       [
         name || null,
         name ? slug : null,
         description || null,
         base_price || null,
+        base_stock !== undefined ? parseInt(base_stock, 10) : null,
         subcategory_id || null,
         product_model_no || null,
         how_to_apply || null,
@@ -523,6 +696,7 @@ exports.updateProduct = async (req, res, next) => {
       const variantImageKey = `variant_main_image_${i}`;
       const secondaryColorKey = `color_secondary_${i}`;
       const secondaryVariantImageKey = `variant_secondary_image_${i}`;
+      const colorPanelImageKey = `color_panel_image_${i}`;
 
       const colorFile =
         req.files?.[colorKey]?.[0] || req.files?.[variantImageKey]?.[0] || null;
@@ -530,6 +704,7 @@ exports.updateProduct = async (req, res, next) => {
         req.files?.[secondaryColorKey]?.[0] ||
         req.files?.[secondaryVariantImageKey]?.[0] ||
         null;
+      const colorPanelFile = req.files?.[colorPanelImageKey]?.[0] || null;
 
       const mainImagePath = colorFile
         ? colorFile.path || colorFile.cloudinary?.secure_url
@@ -540,6 +715,32 @@ exports.updateProduct = async (req, res, next) => {
         : null;
 
       const colorType = variant.color_type || variant.colorType || null;
+
+      const colorPanelUploadedUrl = colorPanelFile
+        ? colorPanelFile.path || colorPanelFile.cloudinary?.secure_url
+        : null;
+
+      const colorPanelValidation = validateColorPanel(
+        variant.color_panel_type || variant.colorPanelType,
+        variant.color_panel_value || variant.colorPanelValue,
+        { requireValue: !variant.id, uploadedUrl: colorPanelUploadedUrl }
+      );
+
+      if (colorPanelValidation.error) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          message: colorPanelValidation.error,
+          variant_index: i,
+        });
+      }
+
+      const colorPanelType = colorPanelValidation.shouldUpdate
+        ? colorPanelValidation.colorPanelType
+        : null;
+
+      const colorPanelValue = colorPanelValidation.shouldUpdate
+        ? colorPanelValidation.colorPanelValue
+        : null;
 
       if (variant.id) {
         /* -------- UPDATE EXISTING VARIANT -------- */
@@ -573,17 +774,21 @@ exports.updateProduct = async (req, res, next) => {
             UPDATE product_variants SET
               shade = COALESCE($1, shade),
               color_type = COALESCE($2, color_type),
-              stock = COALESCE($3, stock),
-              main_image = COALESCE($4, main_image),
-              secondary_image = COALESCE($5, secondary_image),
-              price = COALESCE($6, price),
-              discount_price = COALESCE($7, discount_price),
-              variant_model_no = COALESCE($8, variant_model_no)
-            WHERE id = $9 AND product_id = $10
+              color_panel_type = COALESCE($3, color_panel_type),
+              color_panel_value = COALESCE($4, color_panel_value),
+              stock = COALESCE($5, stock),
+              main_image = COALESCE($6, main_image),
+              secondary_image = COALESCE($7, secondary_image),
+              price = COALESCE($8, price),
+              discount_price = COALESCE($9, discount_price),
+              variant_model_no = COALESCE($10, variant_model_no)
+            WHERE id = $11 AND product_id = $12
             `,
             [
               variant.color || null,
               colorType,
+              colorPanelType,
+              colorPanelValue,
               variant.stock !== undefined ? variant.stock : null,
               mainImagePath,
               secondaryImagePath,
@@ -601,13 +806,15 @@ exports.updateProduct = async (req, res, next) => {
         await client.query(
           `
           INSERT INTO product_variants
-          (product_id, shade, color_type, stock, main_image, secondary_image, price, discount_price, variant_model_no)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          (product_id, shade, color_type, color_panel_type, color_panel_value, stock, main_image, secondary_image, price, discount_price, variant_model_no)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
           `,
           [
             id,
             variant.color,
             colorType,
+            colorPanelType,
+            colorPanelValue,
             variant.stock || 0,
             mainImagePath,
             secondaryImagePath,
@@ -638,12 +845,29 @@ exports.updateProduct = async (req, res, next) => {
       [id]
     );
 
+    const responseProduct = {
+      ...updatedProduct.rows[0],
+      thumbnail: resolveMediaUrl(updatedProduct.rows[0]?.thumbnail_key, updatedProduct.rows[0]?.thumbnail),
+      afterimage: resolveMediaUrl(updatedProduct.rows[0]?.afterimage_key, updatedProduct.rows[0]?.afterimage),
+    };
+
+    const responseVariants = updatedVariants.rows.map((variant) => ({
+      ...variant,
+      main_image: resolveMediaUrl(variant.main_image_key, variant.main_image),
+      secondary_image: resolveMediaUrl(variant.secondary_image_key, variant.secondary_image),
+    }));
+
+    const responseMedia = updatedMedia.rows.map((media) => ({
+      ...media,
+      image_url: resolveMediaUrl(media.image_key, media.image_url),
+    }));
+
     res.json({
       message: "Product updated successfully",
       product: {
-        ...updatedProduct.rows[0],
-        variants: updatedVariants.rows,
-        media: updatedMedia.rows,
+        ...responseProduct,
+        variants: responseVariants,
+        media: responseMedia,
       },
     });
   } catch (err) {

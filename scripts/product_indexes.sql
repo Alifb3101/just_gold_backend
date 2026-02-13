@@ -1,3 +1,4 @@
+
 -- Ensures primary key and unique constraints exist without failing if they already do.
 DO $$
 BEGIN
@@ -27,3 +28,28 @@ CREATE INDEX IF NOT EXISTS idx_product_variants_product_id
 
 CREATE INDEX IF NOT EXISTS idx_product_images_product_id
   ON product_images (product_id);
+
+-- Composite indexes for filter-heavy fields
+CREATE INDEX IF NOT EXISTS idx_products_active_category_price
+  ON products (is_active, category_id, base_price, id);
+
+CREATE INDEX IF NOT EXISTS idx_products_active_price
+  ON products (is_active, base_price, id);
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'products' AND column_name = 'rating'
+  ) THEN
+    CREATE INDEX IF NOT EXISTS idx_products_active_rating
+      ON products (is_active, rating, id);
+  END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_variants_product_price
+  ON product_variants (product_id, price, id);
+
+CREATE INDEX IF NOT EXISTS idx_variants_product_color_size
+  ON product_variants (product_id, shade, variant_model_no);

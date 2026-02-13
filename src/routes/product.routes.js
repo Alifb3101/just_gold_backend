@@ -16,6 +16,7 @@ const buildVariantFields = () => {
   for (let i = 0; i < MAX_VARIANTS; i++) {
     fields.push({ name: `color_${i}`, maxCount: 1 });
     fields.push({ name: `color_secondary_${i}`, maxCount: 1 });
+    fields.push({ name: `color_panel_image_${i}`, maxCount: 1 });
     fields.push({ name: `variant_main_image_${i}`, maxCount: 1 });
     fields.push({ name: `variant_secondary_image_${i}`, maxCount: 1 });
   }
